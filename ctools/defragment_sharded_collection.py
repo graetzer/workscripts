@@ -35,6 +35,7 @@ class ShardedCollection:
         data_size_response = await self.cluster.client[self.ns['db']].command({
             'collStats': self.name,
         }, codec_options=self.cluster.client.codec_options)
+        print(data_size_response)
         return math.ceil(max(float(data_size_response['size']), 1024.0) / 1024.0)
 
     async def data_size_kb_from_shard(self, range):
@@ -329,18 +330,24 @@ async def main(args):
                 consecutive_chunks.append(c)
                 estimated_size_of_consecutive_chunks += args.phase_1_estimated_chunk_size_kb
             elif len(consecutive_chunks) == 1:
-                if not args.dryrun and not 'defrag_collection_est_size' in consecutive_chunks[0]:
-                    chunk_range = [consecutive_chunks[0]['min'], consecutive_chunks[0]['max']]
-                    consecutive_chunks[0]['defrag_collection_est_size'] = await coll.data_size_kb_from_shard(chunk_range)
+                if not 'defrag_collection_est_size' in consecutive_chunks[0]:
+                    if args.dryrun:
+                        consecutive_chunks[0]['defrag_collection_est_size'] = args.phase_1_estimated_chunk_size_kb
+                    else:
+                        chunk_range = [consecutive_chunks[0]['min'], consecutive_chunks[0]['max']]
+                        consecutive_chunks[0]['defrag_collection_est_size'] = await coll.data_size_kb_from_shard(chunk_range)
 
                 remain_chunks.append(consecutive_chunks[0])
 
                 consecutive_chunks = [c]
                 estimated_size_of_consecutive_chunks = args.phase_1_estimated_chunk_size_kb
 
-                if not args.dryrun and not has_more and not 'defrag_collection_est_size' in consecutive_chunks[0]:
-                    chunk_range = [consecutive_chunks[0]['min'], consecutive_chunks[0]['max']]
-                    c['defrag_collection_est_size'] = await coll.data_size_kb_from_shard(chunk_range)
+                if not has_more and not 'defrag_collection_est_size' in consecutive_chunks[0]:
+                    if args.dryrun:
+                        consecutive_chunks[0]['defrag_collection_est_size'] = args.phase_1_estimated_chunk_size_kb
+                    else:
+                        chunk_range = [consecutive_chunks[0]['min'], consecutive_chunks[0]['max']]
+                        c['defrag_collection_est_size'] = await coll.data_size_kb_from_shard(chunk_range)
 
                 continue
             else:
@@ -531,8 +538,8 @@ async def main(args):
             # replace actual shard with mock-up, placement might have changed
             async with index_lock:
                 if args.dryrun:
-                    left_chunk = chunks_id_index[left_chunk['_id']] if left_chunk is None else None
-                    right_chunk = chunks_id_index[right_chunk['_id']] if right_chunk is None else None
+                    left_chunk = chunks_id_index[left_chunk['_id']] if not left_chunk is None else None
+                    right_chunk = chunks_id_index[right_chunk['_id']] if not right_chunk is None else None
 
                 # This code is to enable multi-threading
                 if c['_id'] in chunks_in_use:
@@ -557,7 +564,6 @@ async def main(args):
                     (await get_chunk_imbalance_or_0(left_chunk)) >= (await get_chunk_imbalance_or_0(right_chunk))):
                     # TODO abort if target shard has too much data already
 
-#                    progress.write(f'Left merge: Moving chunk from {shard} to {target_shard}, merging {[left_chunk['min'], c['max']]}, new size: {new_size}')
 
                     if not args.dryrun:
                         lock_order = [shard, target_shard]
@@ -567,6 +573,9 @@ async def main(args):
                                 if target_shard != shard:
                                     await coll.move_chunk(c, target_shard)
                                 await coll.merge_chunks([left_chunk, c], args.phase_1_perform_unsafe_merge)
+                    else:
+                        bounds = [left_chunk['min'], c['max']]
+                        progress.write(f'Moving chunk from {shard} to {target_shard}, merging {bounds}, new size: {new_size}')
 
                     # update local map, 
                     async with index_lock:
@@ -586,7 +595,6 @@ async def main(args):
                 if target_shard == shard or center_size_kb <= right_size:
                     # TODO abort if target shard has too much data already
 
-#                    progress.write(f'Right merge: Moving chunk from {c["shard"]} to {right_chunk["shard"]}, merging {[c['min'], right_chunk['max']]}, new size: {new_size}')
                     if not args.dryrun:
                         lock_order = [shard, target_shard]
                         lock_order.sort()
@@ -595,6 +603,9 @@ async def main(args):
                                 if target_shard != shard:
                                     await coll.move_chunk(c, target_shard)
                                 await coll.merge_chunks([c, right_chunk], args.phase_1_perform_unsafe_merge)
+                    else:
+                        bounds = [c['min'], right_chunk['max']]
+                        progress.write(f'Moving chunk from {c["shard"]} to {right_chunk["shard"]}, merging {bounds}, new size: {new_size}')
 
                     # update local map
                     async with index_lock:
@@ -627,10 +638,10 @@ async def main(args):
             tasks = []
             # TODO balancer logic prevents us from donating / receiving more than once per shard
             for s in shard_to_chunks:
-#                await move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)
-                tasks.append(
-                    asyncio.ensure_future(move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)))
-            await asyncio.gather(*tasks)
+                await move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)
+#                tasks.append(
+#                    asyncio.ensure_future(move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)))
+#            await asyncio.gather(*tasks)
         
         num_chunks = await cluster.configDb.chunks.count_documents({'ns': coll.name})
         if num_chunks < ideal_num_chunks * 1.3:
