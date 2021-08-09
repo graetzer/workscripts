@@ -390,15 +390,15 @@ async def main(args):
             sem = (sem_at_collection_version
                         if shard_is_at_collection_version else sem_at_less_than_collection_version)
             async with sem:
+                new_chunk = consecutive_chunks[0].copy()
+                new_chunk['max'] = consecutive_chunks[-1]['max']
+                new_chunk['defrag_collection_est_size'] = actual_size_of_consecutive_chunks
+                remain_chunks.append(new_chunk)
+                        
                 if not args.dryrun:
                     try:
                         await coll.merge_chunks(consecutive_chunks,
                                                 args.phase_1_perform_unsafe_merge)
-                        new_chunk = consecutive_chunks[0].copy()
-                        new_chunk['max'] = consecutive_chunks[-1]['max']
-                        new_chunk['defrag_collection_est_size'] = actual_size_of_consecutive_chunks
-                        remain_chunks.append(new_chunk)
-                        
                     except pymongo_errors.OperationFailure as ex:
                         if ex.details['code'] == 46:  # The code for LockBusy
                             num_lock_busy_errors_encountered += 1
@@ -427,6 +427,8 @@ async def main(args):
             shard_is_at_collection_version = True
 
         # replace list of chunks
+        fdff = len(remain_chunks)
+        print(f"remaining chunks {fdff}")
         shard_entry['chunks'] = remain_chunks
 
     
@@ -452,16 +454,17 @@ async def main(args):
     index_lock = asyncio.Lock()
     shard_locks = {}
     chunks_id_index = {}
+    chunks_min_index = {}
+    chunks_max_index = {}
     chunks_in_use = set()
     for s in shard_to_chunks:
         shard_locks[s] = asyncio.Lock()
         for c in shard_to_chunks[s]['chunks']:
             assert(chunks_id_index.get(c['_id']) == None)
 
-            # now everything references c
             chunks_id_index[c['_id']] = c
-            c['bla'] = 1
-            assert(chunks_id_index[c['_id']]['bla'] == 1)
+            chunks_min_index[frozenset(c['min'].items())] = c
+            chunks_max_index[frozenset(c['max'].items())] = c
 
     # might be called with a chunk document without size estimation
     async def get_chunk_size(ch):
@@ -487,9 +490,8 @@ async def main(args):
             return
 
         async def get_chunk_imbalance_or_0(target_chunk):
-            if (target_chunk is None):
+            if (target_chunk is None) or target_chunk['shard'] == shard:
                 return 0
-            assert(target_chunk['shard'] != shard)
 
             size = await get_chunk_size(target_chunk)
             size_remain = (size % target_chunk_size_kb)
@@ -499,6 +501,8 @@ async def main(args):
                 return abs(size_remain - target_chunk_size_kb)
 
         num_chunks = len(shard_chunks)
+
+        progress.write(f'Moving small chunks off shard {shard}')
 
         # def get_chunk_size_or_0(ch):
         #     if 'defrag_collection_est_size' in ch:
@@ -511,21 +515,26 @@ async def main(args):
 
             # Abort if we have too few chunks already
             if num_chunks <= idealNumChunks + 1:
+                progress.write(f"too few chunks already on shard {shard}: {num_chunks} < {idealNumChunks} + 1")
                 return
 
-            center_size_kb = await get_chunk_size(c)
+            # this chunk might no longer exist due to a move
+            if c['_id'] not in chunks_id_index:
+                continue
 
             # avoid moving larger chunks
+            center_size_kb = await get_chunk_size(c)
             if center_size_kb > target_chunk_size_kb * 0.8:
                 continue
 
             # chunks should be on other shards, but if this script was executed multiple times or 
-            # due to parallelism the chunks might now be on the same shard
+            # due to parallelism the chunks might now be on the same shard            
 
-            left_chunk = await cluster.configDb.chunks.find_one({'ns':coll.name, 'max': c['min']})
-            right_chunk = await cluster.configDb.chunks.find_one({'ns':coll.name, 'min': c['max']})
+            left_chunk = None # await cluster.configDb.chunks.find_one({'ns':coll.name, 'max': c['min']})
+            right_chunk = None # await cluster.configDb.chunks.find_one({'ns':coll.name, 'min': c['max']})
 
             def remove_from_useage():
+                return
                 if c['_id'] in chunks_in_use:
                     chunks_in_use.remove(c['_id']) 
                 if not left_chunk is None:
@@ -535,64 +544,64 @@ async def main(args):
                     if right_chunk['_id'] in chunks_in_use:
                         chunks_in_use.remove(right_chunk['_id']) 
 
-            # replace actual shard with mock-up, placement might have changed
             async with index_lock:
-                if args.dryrun:
-                    left_chunk = chunks_id_index[left_chunk['_id']] if not left_chunk is None else None
-                    right_chunk = chunks_id_index[right_chunk['_id']] if not right_chunk is None else None
+                left_chunk = chunks_max_index.get(frozenset(c['min'].items()))
+                right_chunk = chunks_min_index.get(frozenset(c['max'].items()))
 
                 # This code is to enable multi-threading
-                if c['_id'] in chunks_in_use:
-                    continue
-                chunks_in_use.add(c['_id'])
-                if not left_chunk is None:
-                    if left_chunk['_id'] in chunks_in_use:
-                        remove_from_useage()
-                        continue
-                    chunks_in_use.add(left_chunk['_id'])
-                if not right_chunk is None:
-                    if right_chunk['_id'] in chunks_in_use:
-                        remove_from_useage()
-                        continue
-                    chunks_in_use.add(right_chunk['_id'])
+                # if c['_id'] in chunks_in_use:
+                #     continue
+                # chunks_in_use.add(c['_id'])
+                # if not left_chunk is None:
+                #     if left_chunk['_id'] in chunks_in_use:
+                #         remove_from_useage()
+                #         continue
+                #     chunks_in_use.add(left_chunk['_id'])
+                # if not right_chunk is None:
+                #     if right_chunk['_id'] in chunks_in_use:
+                #         remove_from_useage()
+                #         continue
+                #     chunks_in_use.add(right_chunk['_id'])
 
-            if not (left_chunk is None):
+            # TODO consider max datasize per shard here ?
+
+            if not (left_chunk is None) and left_chunk['shard'] != shard:
                 target_shard = left_chunk['shard']
                 left_size = await get_chunk_size(left_chunk)
                 new_size = left_size + center_size_kb
-                if target_shard == shard or (right_chunk['shard'] != shard and center_size_kb <= left_size and 
-                    (await get_chunk_imbalance_or_0(left_chunk)) >= (await get_chunk_imbalance_or_0(right_chunk))):
+                if center_size_kb <= left_size and (
+                    await get_chunk_imbalance_or_0(left_chunk)) >= (await get_chunk_imbalance_or_0(right_chunk)):
                     # TODO abort if target shard has too much data already
-
 
                     if not args.dryrun:
                         lock_order = [shard, target_shard]
                         lock_order.sort()
                         async with shard_locks[lock_order[0]]:
                             async with shard_locks[lock_order[1]]:
-                                if target_shard != shard:
-                                    await coll.move_chunk(c, target_shard)
+                                await coll.move_chunk(c, target_shard)
                                 await coll.merge_chunks([left_chunk, c], args.phase_1_perform_unsafe_merge)
                     else:
                         bounds = [left_chunk['min'], c['max']]
-                        progress.write(f'Moving chunk from {shard} to {target_shard}, merging {bounds}, new size: {new_size}')
+                        progress.write(f'Moving chunk left from {shard} to {target_shard}, merging {bounds}, new size: {new_size}')
 
                     # update local map, 
                     async with index_lock:
                         chunks_id_index.pop(c['_id']) # only first chunk is kept
-                        local_ch = chunks_id_index[left_chunk['_id']]
-                        local_ch['max'] = c['max']
-                        local_ch['defrag_collection_est_size'] = new_size
+                        chunks_min_index.pop(frozenset(c['min'].items()))
+                        chunks_max_index.pop(frozenset(left_chunk['max'].items()))
+                        chunks_max_index[frozenset(c['max'].items())] = left_chunk
+                        left_chunk['max'] = c['max']
+                        left_chunk['defrag_collection_est_size'] = new_size
                         remove_from_useage()
 
                     num_chunks -= 1
                     continue
             
-            if not (right_chunk is None):
+            if not (right_chunk is None) and right_chunk['shard'] != shard:
                 target_shard = right_chunk['shard']
                 right_size = await get_chunk_size(right_chunk)
                 new_size = right_size + center_size_kb
-                if target_shard == shard or center_size_kb <= right_size:
+                if center_size_kb <= right_size:
                     # TODO abort if target shard has too much data already
 
                     if not args.dryrun:
@@ -600,56 +609,28 @@ async def main(args):
                         lock_order.sort()
                         async with shard_locks[lock_order[0]]:
                             async with shard_locks[lock_order[1]]:
-                                if target_shard != shard:
-                                    await coll.move_chunk(c, target_shard)
+                                await coll.move_chunk(c, target_shard)
                                 await coll.merge_chunks([c, right_chunk], args.phase_1_perform_unsafe_merge)
                     else:
                         bounds = [c['min'], right_chunk['max']]
-                        progress.write(f'Moving chunk from {c["shard"]} to {right_chunk["shard"]}, merging {bounds}, new size: {new_size}')
+                        progress.write(f'Moving chunk right from {c["shard"]} to {right_chunk["shard"]}, merging {bounds}, new size: {new_size}')
 
                     # update local map
                     async with index_lock:
                         chunks_id_index.pop(right_chunk['_id']) # only first chunk is kept
-                        local_ch = chunks_id_index[c['_id']]
-                        local_ch['max'] = right_chunk['max']
-                        local_ch['defrag_collection_est_size'] = new_size
+                        chunks_min_index.pop(frozenset(right_chunk['min'].items()))
+                        chunks_max_index.pop(frozenset(c['max'].items()))
+                        chunks_max_index[frozenset(right_chunk['max'].items())] = c
+                        c['shard'] = target_shard
+                        c['max'] = right_chunk['max']
+                        c['defrag_collection_est_size'] = new_size
                         remove_from_useage()
 
                     num_chunks -= 1
                     continue
 
-    num_shards = await cluster.configDb.shards.count_documents({})
-    coll_size_kb = await coll.data_size_kb()
-    ideal_num_chunks = max(math.ceil(coll_size_kb / target_chunk_size_kb), num_shards)
-    ideal_num_chunks_per_shard = min(math.ceil(ideal_num_chunks / num_shards), 1)
+#            progress.write(f'Did not move small chunk')
 
-    num_chunks = await cluster.configDb.chunks.count_documents({'ns': coll.name})
-
-    print('Phase 2: Moving and merging small chunks')
-    print(f'Collection size {coll_size_kb} kb')
-
-    # Move and merge small chunks. The way this is written it might need to run multiple times
-    max_iterations = 10
-    while max_iterations > 0:
-        max_iterations -= 1
-        print(f"""Number of chunks is {num_chunks} the ideal number of chunks is {ideal_num_chunks}""")
-
-        with tqdm(total=num_chunks, unit=' chunks') as progress:
-            tasks = []
-            # TODO balancer logic prevents us from donating / receiving more than once per shard
-            for s in shard_to_chunks:
-                await move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)
-#                tasks.append(
-#                    asyncio.ensure_future(move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)))
-#            await asyncio.gather(*tasks)
-        
-        num_chunks = await cluster.configDb.chunks.count_documents({'ns': coll.name})
-        if num_chunks < ideal_num_chunks * 1.3:
-            break
-
-    ###############################################################################################
-    # PHASE 3 (Split-oversized): The previous phase might produce oversized chunks, we just go 
-    # ahead and split them here
 
     async def split_oversized_chunks(shard, progress):
         if args.dryrun:
@@ -662,18 +643,62 @@ async def main(args):
             if local_c['defrag_collection_est_size'] > target_chunk_size_kb * 1.4:
                 await coll.split_chunk_middle(local_c)
 
-    num_chunks = await cluster.configDb.chunks.count_documents({'ns': coll.name})
-    with tqdm(total=num_chunks, unit=' chunks') as progress:
-        tasks = []
+    num_shards = await cluster.configDb.shards.count_documents({})
+    coll_size_kb = await coll.data_size_kb()
+    ideal_num_chunks = max(math.ceil(coll_size_kb / target_chunk_size_kb), num_shards)
+    ideal_num_chunks_per_shard = min(math.ceil(ideal_num_chunks / num_shards), 1)
+
+    num_chunks = len(chunks_id_index)
+    if not args.dryrun:
+        num_chunks_actual = await cluster.configDb.chunks.count_documents({'ns': coll.name})
+        assert(num_chunks_actual == num_chunks)
+
+    print('Phase 2: Moving and merging small chunks')
+    print(f'Collection size {coll_size_kb} kb')
+
+    # Move and merge small chunks. The way this is written it might need to run multiple times
+    max_iterations = 25
+    while max_iterations > 0:
+        max_iterations -= 1
+        print(f"""Number of chunks is {num_chunks} the ideal number of chunks is {ideal_num_chunks}, per shard {ideal_num_chunks_per_shard}""")
+
+        with tqdm(total=num_chunks, unit=' chunks') as progress:
+            tasks = []
+            # TODO balancer logic prevents us from donating / receiving more than once per shard
+            for s in shard_to_chunks:
+                await move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)
+#                tasks.append(
+#                    asyncio.ensure_future(move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)))
+#            await asyncio.gather(*tasks)
+
+        # update shard_to_chunks
         for s in shard_to_chunks:
-            tasks.append(
-                asyncio.ensure_future(split_oversized_chunks(s, progress)))
-        await asyncio.gather(*tasks)
+            shard_to_chunks[s]['chunks'] = []
+        
+        for cid in chunks_id_index:
+            c = chunks_id_index[cid]
+            shard_to_chunks[c['shard']]['chunks'].append(c)
+        
+        num_chunks = len(chunks_id_index)
+        if not args.dryrun:
+            num_chunks_actual = await cluster.configDb.chunks.count_documents({'ns': coll.name})
+            assert(num_chunks_actual == num_chunks)
 
-    num_chunks = await cluster.configDb.chunks.count_documents({'ns': coll.name})
+        if num_chunks < math.ceil(ideal_num_chunks * 1.3):
+            break
+
+        print('Phase 2.2: Splitting oversized chunks')
+
+        num_chunks = len(chunks_id_index)
+        with tqdm(total=num_chunks, unit=' chunks') as progress:
+            tasks = []
+            for s in shard_to_chunks:
+                tasks.append(
+                    asyncio.ensure_future(split_oversized_chunks(s, progress)))
+            await asyncio.gather(*tasks)
+
+    num_chunks = len(chunks_id_index)
     print(f"""Number of chunks is {num_chunks} the ideal number of chunks is {ideal_num_chunks}""")
-
-# TODO split phase
 
 if __name__ == "__main__":
     argsParser = argparse.ArgumentParser(
