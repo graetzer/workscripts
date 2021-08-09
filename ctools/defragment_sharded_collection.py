@@ -426,9 +426,9 @@ async def main(args):
             shard_entry['num_merges_performed'] += 1
             shard_is_at_collection_version = True
 
-        # replace list of chunks
-        fdff = len(remain_chunks)
-        print(f"remaining chunks {fdff}")
+        # replace list of chunks for phase 2
+        num_remain = len(remain_chunks)
+        progress.write(f'Remaining chunks on shard {shard}: {num_remain}')
         shard_entry['chunks'] = remain_chunks
 
     
