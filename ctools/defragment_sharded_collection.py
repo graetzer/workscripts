@@ -37,6 +37,15 @@ class ShardedCollection:
         }, codec_options=self.cluster.client.codec_options)
         return math.ceil(max(float(data_size_response['size']), 1024.0) / 1024.0)
 
+    # TODO this method does not work as is now
+    async def data_size_kb_entire_shard(self, shard):
+        pipeline = [{"$collStats": {"storageStats": {}}},
+                    {"$match": {"shard": shard}}]
+        list = await self.cluster.client[self.name['db']][self.name['coll']].aggregate(pipeline).to_list(1)
+        print(list)
+        size = list[0]['storageStats']['size']
+        return math.ceil(max(float(size), 1024.0) / 1024.0)
+
     async def data_size_kb_from_shard(self, range):
         data_size_response = await self.cluster.client[self.ns['db']].command({
             'dataSize': self.name,
@@ -315,11 +324,14 @@ async def main(args):
                 estimated_size_of_consecutive_chunks = args.phase_1_estimated_chunk_size_kb
 
                 if not has_more:
-                  remain_chunks.append(c)
-                  if not args.dryrun:
-                    c['defrag_collection_est_size'] = await coll.data_size_kb_from_shard([c['min'], c['max']])
-                  else:
-                    c['defrag_collection_est_size'] = args.phase_1_estimated_chunk_size_kb
+                    remain_chunks.append(c)
+                    if 'defrag_collection_est_size' not in c:
+                        if not args.dryrun:
+                            c['defrag_collection_est_size'] = args.phase_1_estimated_chunk_size_kb
+                        else:
+                            chunk_range = [c['min'], c['max']]
+                            c['defrag_collection_est_size'] = await coll.data_size_kb_from_shard(chunk_range)
+                            await coll.try_write_chunk_size(chunk_range, shard, c['defrag_collection_est_size'])
 
                 continue
 
@@ -329,24 +341,30 @@ async def main(args):
                 consecutive_chunks.append(c)
                 estimated_size_of_consecutive_chunks += args.phase_1_estimated_chunk_size_kb
             elif len(consecutive_chunks) == 1:
-                if not 'defrag_collection_est_size' in consecutive_chunks[0]:
+                if 'defrag_collection_est_size' not in consecutive_chunks[0]:
                     if args.dryrun:
                         consecutive_chunks[0]['defrag_collection_est_size'] = args.phase_1_estimated_chunk_size_kb
                     else:
                         chunk_range = [consecutive_chunks[0]['min'], consecutive_chunks[0]['max']]
-                        consecutive_chunks[0]['defrag_collection_est_size'] = await coll.data_size_kb_from_shard(chunk_range)
+                        data_size_kb = await coll.data_size_kb_from_shard(chunk_range)
+                        await coll.try_write_chunk_size(chunk_range, shard, data_size_kb)
+                        consecutive_chunks[0]['defrag_collection_est_size'] = data_size_kb
 
                 remain_chunks.append(consecutive_chunks[0])
 
                 consecutive_chunks = [c]
                 estimated_size_of_consecutive_chunks = args.phase_1_estimated_chunk_size_kb
 
-                if not has_more and not 'defrag_collection_est_size' in consecutive_chunks[0]:
-                    if args.dryrun:
-                        consecutive_chunks[0]['defrag_collection_est_size'] = args.phase_1_estimated_chunk_size_kb
-                    else:
-                        chunk_range = [consecutive_chunks[0]['min'], consecutive_chunks[0]['max']]
-                        c['defrag_collection_est_size'] = await coll.data_size_kb_from_shard(chunk_range)
+                if not has_more:
+                    remain_chunks.append(c)
+                    if 'defrag_collection_est_size' not in consecutive_chunks[0]:
+                        if args.dryrun:
+                            consecutive_chunks[0]['defrag_collection_est_size'] = args.phase_1_estimated_chunk_size_kb
+                        else:
+                            chunk_range = [consecutive_chunks[0]['min'], consecutive_chunks[0]['max']]
+                            data_size_kb = await coll.data_size_kb_from_shard(chunk_range)
+                            await coll.try_write_chunk_size(chunk_range, shard, data_size_kb)
+                            c['defrag_collection_est_size'] = data_size_kb
 
                 continue
             else:
@@ -398,6 +416,8 @@ async def main(args):
                     try:
                         await coll.merge_chunks(consecutive_chunks,
                                                 args.phase_1_perform_unsafe_merge)
+                        await coll.try_write_chunk_size(merge_bounds, shard,
+                                                        actual_size_of_consecutive_chunks)
                     except pymongo_errors.OperationFailure as ex:
                         if ex.details['code'] == 46:  # The code for LockBusy
                             num_lock_busy_errors_encountered += 1
