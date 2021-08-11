@@ -41,7 +41,7 @@ class ShardedCollection:
     async def data_size_kb_entire_shard(self, shard):
         pipeline = [{"$collStats": {"storageStats": {}}},
                     {"$match": {"shard": shard}}]
-        list = await self.cluster.client[self.name['db']][self.name['coll']].aggregate(pipeline).to_list(1)
+        list = await self.cluster.client[self.ns['db']][self.ns['coll']].aggregate(pipeline).to_list(1)
         print(list)
         size = list[0]['storageStats']['size']
         return math.ceil(max(float(size), 1024.0) / 1024.0)
@@ -448,8 +448,6 @@ async def main(args):
             shard_is_at_collection_version = True
 
         # replace list of chunks for phase 2
-        num_remain = len(remain_chunks)
-        progress.write(f'Remaining chunks on shard {shard}: {num_remain}')
         shard_entry['chunks'] = remain_chunks
 
     
@@ -542,8 +540,8 @@ async def main(args):
 
             # avoid moving larger chunks
             center_size_kb = await get_chunk_size(c)
-            # Use 0.6 so that we do not move chunks which were split before 0.6 < 1.25 / 2
-            if center_size_kb > target_chunk_size_kb * 0.6:
+            # Use 0.6 so that we do not move chunks which were split before
+            if center_size_kb > target_chunk_size_kb * 0.4:
                 continue
 
             # chunks should be on other shards, but if this script was executed multiple times or 
@@ -619,7 +617,7 @@ async def main(args):
             progress.update()
 
             local_c = chunks_id_index[c['_id']]
-            if local_c['defrag_collection_est_size'] > target_chunk_size_kb * 1.25:
+            if local_c['defrag_collection_est_size'] > target_chunk_size_kb * 1.2:
                 await coll.split_chunk_middle(local_c)
 
     num_shards = await cluster.configDb.shards.count_documents({})
@@ -627,17 +625,26 @@ async def main(args):
     ideal_num_chunks = max(math.ceil(coll_size_kb / target_chunk_size_kb), num_shards)
     ideal_num_chunks_per_shard = min(math.ceil(ideal_num_chunks / num_shards), 1)
 
-    num_chunks = len(chunks_id_index)
-    if not args.dryrun:
-        num_chunks_actual = await cluster.configDb.chunks.count_documents({'ns': coll.name})
-        print(f"Num chunks actual {num_chunks_actual}, local chunks {num_chunks}")
-#        assert(num_chunks_actual == num_chunks)
+    def print_remaining():
+        for s in shard_to_chunks:
+            chunks = shard_to_chunks[s]['chunks']
+            num_chunks_per_shard = len(chunks)
+            data_size = 0
+            for c in chunks:
+                if 'defrag_collection_est_size' in c:
+                    data_size += c['defrag_collection_est_size']
+                else:
+                    data_size += args.phase_1_estimated_chunk_size_kb
+
+            print(f"Number of chunks on shard {s}: {num_chunks_per_shard}  Data size: {data_size}")
 
     print('Phase 2: Moving and merging small chunks')
     print(f'Collection size {coll_size_kb} kb')
+    print_remaining()
 
     # Move and merge small chunks. The way this is written it might need to run multiple times
     max_iterations = 25
+    num_chunks = len(chunks_id_index)
     while max_iterations > 0:
         max_iterations -= 1
         print(f"""Number of chunks is {num_chunks} the ideal number of chunks is {ideal_num_chunks}, per shard {ideal_num_chunks_per_shard}""")
@@ -679,6 +686,7 @@ async def main(args):
 
     num_chunks = len(chunks_id_index)
     print(f"""Number of chunks is {num_chunks} the ideal number of chunks is {ideal_num_chunks}""")
+    print_remaining()
 
 if __name__ == "__main__":
     argsParser = argparse.ArgumentParser(
