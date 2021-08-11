@@ -542,7 +542,8 @@ async def main(args):
 
             # avoid moving larger chunks
             center_size_kb = await get_chunk_size(c)
-            if center_size_kb > target_chunk_size_kb * 0.8:
+            # Use 0.6 so that we do not move chunks which were split before 0.6 < 1.25 / 2
+            if center_size_kb > target_chunk_size_kb * 0.6:
                 continue
 
             # chunks should be on other shards, but if this script was executed multiple times or 
@@ -618,7 +619,7 @@ async def main(args):
             progress.update()
 
             local_c = chunks_id_index[c['_id']]
-            if local_c['defrag_collection_est_size'] > target_chunk_size_kb * 1.4:
+            if local_c['defrag_collection_est_size'] > target_chunk_size_kb * 1.25:
                 await coll.split_chunk_middle(local_c)
 
     num_shards = await cluster.configDb.shards.count_documents({})
