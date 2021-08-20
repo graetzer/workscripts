@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import logging
 import math
+from motor.frameworks.asyncio import is_event_loop
 import pymongo
 import sys
 
@@ -191,6 +192,12 @@ async def main(args):
             target_chunk_size_kb = args.dryrun
     else:
         target_chunk_size_kb = chunk_size_doc['value'] * 1024
+
+    if args.small_chunk_frac <= 0 or args.small_chunk_frac > 0.5:
+        raise Exception("The value for --small-chunk-threshold must be between 0 and 0.5")
+
+    if args.shard_imbalance_frac <= 1.0 or args.shard_imbalance_frac > 1.5:
+        raise Exception("The value for --shard-imbalance-threshold must be between 1.0 and 1.5")
 
     if args.dryrun:
         print(f"""Performing a dry run with target chunk size of {target_chunk_size_kb} KB.
@@ -469,14 +476,15 @@ async def main(args):
     # Phase 1 in order to calculate the most optimal move strategy.
     #
 
-    # we need to enforce rate limits on certain operations
+    total_shard_size = {}
+
+    # Mirror the config.chunks indexes in memory
     chunks_id_index = {}
     chunks_min_index = {}
     chunks_max_index = {}
     for s in shard_to_chunks:
         for c in shard_to_chunks[s]['chunks']:
             assert(chunks_id_index.get(c['_id']) == None)
-
             chunks_id_index[c['_id']] = c
             chunks_min_index[frozenset(c['min'].items())] = c
             chunks_max_index[frozenset(c['max'].items())] = c
@@ -498,10 +506,12 @@ async def main(args):
         return data_size_kb
 
     async def move_merge_chunks_by_size(shard, idealNumChunks, progress):
+        total_moved_data_kb = 0
+
         shard_entry = shard_to_chunks[shard]
         shard_chunks = shard_entry['chunks']
         if len(shard_chunks) == 0:
-            return
+            return 0
 
         async def get_chunk_imbalance_or_0(target_chunk):
             if (target_chunk is None) or target_chunk['shard'] == shard:
@@ -532,7 +542,7 @@ async def main(args):
             # Abort if we have too few chunks already
             if num_chunks <= idealNumChunks + 1:
                 progress.write(f"too few chunks already on shard {shard}: {num_chunks} < {idealNumChunks} + 1")
-                return
+                break
 
             # this chunk might no longer exist due to a move
             if c['_id'] not in chunks_id_index:
@@ -540,9 +550,9 @@ async def main(args):
 
             # avoid moving larger chunks
             center_size_kb = await get_chunk_size(c)
-            # Use 0.6 so that we do not move chunks which were split before
-            if center_size_kb > target_chunk_size_kb * 0.4:
-                continue
+            # Use < 0.6 so that we do not move chunks which were split before
+            if center_size_kb > target_chunk_size_kb * args.small_chunk_frac:
+                break
 
             # chunks should be on other shards, but if this script was executed multiple times or 
             # due to parallelism the chunks might now be on the same shard            
@@ -552,15 +562,29 @@ async def main(args):
 #                if not args.dryrun:
 #                    assert(left_chunk is None or (await cluster.configDb.chunks.find_one({'ns':coll.name, 'max': c['min']}))['shard'] == left_chunk['shard'])
 
-            # TODO consider max datasize per shard here ?
+            # skip chunks on same shard
+            if left_chunk is not None and left_chunk['shard'] == shard:
+                left_chunk = None
+            if right_chunk is not None and right_chunk['shard'] == shard:
+                right_chunk = None
+            
+            # Exclude overweight target shards
+            if left_chunk is not None and right_chunk is not None:
+                if total_shard_size[left_chunk['shard']] > total_shard_size[right_chunk['shard']] * args.shard_imbalance_frac:
+                    left_chunk = None
+                elif total_shard_size[right_chunk['shard']] > total_shard_size[left_chunk['shard']] * args.shard_imbalance_frac:
+                    right_chunk = None
+                else:
+                    pass
 
-            if not (left_chunk is None) and left_chunk['shard'] != shard:
+            if left_chunk is not None:
                 target_shard = left_chunk['shard']
                 left_size = await get_chunk_size(left_chunk)
                 new_size = left_size + center_size_kb
-                if center_size_kb <= left_size and (
+                is_overweight = total_shard_size[shard] > total_shard_size[target_shard] * args.shard_imbalance_frac
+                # only move a smaller chunk unless shard is bigger
+                if (center_size_kb <= left_size or is_overweight) and (
                     await get_chunk_imbalance_or_0(left_chunk)) >= (await get_chunk_imbalance_or_0(right_chunk)):
-                    # TODO abort if target shard has too much data already
 
                     if not args.dryrun:
                         await coll.move_chunk(c, target_shard)
@@ -577,14 +601,18 @@ async def main(args):
                     left_chunk['max'] = c['max']
                     left_chunk['defrag_collection_est_size'] = new_size
 
+                    total_shard_size[shard] -= center_size_kb
+                    total_shard_size[target_shard] += center_size_kb
+                    total_moved_data_kb += center_size_kb
                     num_chunks -= 1
                     continue
             
-            if not (right_chunk is None) and right_chunk['shard'] != shard:
+            if right_chunk is not None:
                 target_shard = right_chunk['shard']
                 right_size = await get_chunk_size(right_chunk)
                 new_size = right_size + center_size_kb
-                if center_size_kb <= right_size:
+                is_overweight = total_shard_size[shard] > total_shard_size[target_shard] * 1.2
+                if center_size_kb <= right_size or is_overweight:
                     # TODO abort if target shard has too much data already
 
                     if not args.dryrun:
@@ -603,11 +631,13 @@ async def main(args):
                     c['max'] = right_chunk['max']
                     c['defrag_collection_est_size'] = new_size
 
+                    total_shard_size[shard] -= center_size_kb
+                    total_shard_size[target_shard] += center_size_kb
+                    total_moved_data_kb += center_size_kb
                     num_chunks -= 1
                     continue
-
-#            progress.write(f'Did not move small chunk')
-
+        # </for c in sorted_chunks:>
+        return total_moved_data_kb
 
     async def split_oversized_chunks(shard, progress):
         if args.dryrun:
@@ -622,42 +652,54 @@ async def main(args):
 
     num_shards = await cluster.configDb.shards.count_documents({})
     coll_size_kb = await coll.data_size_kb()
+
+    sum_coll_size = 0
+    for s in shard_to_chunks:
+        data_size = 0
+        for c in shard_to_chunks[s]['chunks']:
+            if 'defrag_collection_est_size' in c:
+                data_size += c['defrag_collection_est_size']
+            else:
+                data_size += args.phase_1_estimated_chunk_size_kb
+        total_shard_size[s] = data_size
+        sum_coll_size += data_size
+    
+    # If we run on a dummy cluster assume collection size
+    if args.dryrun and coll_size_kb == 1:
+        coll_size_kb = sum_coll_size
+
+    avg_chunk_size_phase_1 = sum_coll_size / len(chunks_id_index)
     ideal_num_chunks = max(math.ceil(coll_size_kb / target_chunk_size_kb), num_shards)
     ideal_num_chunks_per_shard = min(math.ceil(ideal_num_chunks / num_shards), 1)
 
-    def print_remaining():
-        for s in shard_to_chunks:
-            chunks = shard_to_chunks[s]['chunks']
-            num_chunks_per_shard = len(chunks)
-            data_size = 0
-            for c in chunks:
-                if 'defrag_collection_est_size' in c:
-                    data_size += c['defrag_collection_est_size']
-                else:
-                    data_size += args.phase_1_estimated_chunk_size_kb
-
-            print(f"Number of chunks on shard {s}: {num_chunks_per_shard}  Data size: {data_size}")
-
     print('Phase 2: Moving and merging small chunks')
-    print(f'Collection size {coll_size_kb} kb')
-    print_remaining()
+    print(f'Collection size {coll_size_kb} kb. Avg chunk size Phase I {avg_chunk_size_phase_1} kb')
+
+    orig_shard_sizes = total_shard_size.copy()
+    for s in shard_to_chunks:
+        num_chunks_per_shard = len(shard_to_chunks[s]['chunks'])
+        data_size = total_shard_size[s]
+        print(f"Number chunks on shard {s}: {num_chunks_per_shard}  Data-Size: {data_size} kb")
 
     # Move and merge small chunks. The way this is written it might need to run multiple times
     max_iterations = 25
     num_chunks = len(chunks_id_index)
+    total_moved_data_kb = 0
     while max_iterations > 0:
         max_iterations -= 1
-        print(f"""Number of chunks is {num_chunks} the ideal number of chunks is {ideal_num_chunks}, per shard {ideal_num_chunks_per_shard}""")
+        print(f"""Number of chunks is {num_chunks} the ideal number of chunks based on collection size is {ideal_num_chunks}, per shard {ideal_num_chunks_per_shard}""")
 
+        moved_data_kb = 0
         with tqdm(total=num_chunks, unit=' chunks') as progress:
             tasks = []
             # TODO balancer logic prevents us from donating / receiving more than once per shard
             for s in shard_to_chunks:
-                await move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)
+                moved_data_kb += await move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)
 #                tasks.append(
 #                    asyncio.ensure_future(move_merge_chunks_by_size(s, ideal_num_chunks_per_shard, progress)))
 #            await asyncio.gather(*tasks)
 
+        total_moved_data_kb += moved_data_kb
         # update shard_to_chunks
         for s in shard_to_chunks:
             shard_to_chunks[s]['chunks'] = []
@@ -671,10 +713,10 @@ async def main(args):
             num_chunks_actual = await cluster.configDb.chunks.count_documents({'ns': coll.name})
             assert(num_chunks_actual == num_chunks)
 
-        if num_chunks < math.ceil(ideal_num_chunks * 1.3):
+        if num_chunks < math.ceil(ideal_num_chunks * 1.25) or moved_data_kb == 0:
             break
 
-        print('Phase 2.2: Splitting oversized chunks')
+        print('Phase 2.2: Splitting oversized chunks, moved {moved_data_kb} kb of data')
 
         num_chunks = len(chunks_id_index)
         with tqdm(total=num_chunks, unit=' chunks') as progress:
@@ -685,8 +727,20 @@ async def main(args):
             await asyncio.gather(*tasks)
 
     num_chunks = len(chunks_id_index)
-    print(f"""Number of chunks is {num_chunks} the ideal number of chunks is {ideal_num_chunks}""")
-    print_remaining()
+    print(f"""Number of chunks is {num_chunks} the ideal number of chunks would be {ideal_num_chunks} for a collection size of {coll_size_kb}""")
+
+    avg_chunk_size_phase_2 = 0
+    for s in shard_to_chunks:
+        num_chunks_per_shard = len(shard_to_chunks[s]['chunks'])
+        data_size = total_shard_size[s]
+        avg_chunk_size_phase_2 += data_size
+        print(f"Number chunks on {s}: {num_chunks_per_shard}  Data-Size: {data_size} kb "
+              f"Change vs phase I: {data_size - orig_shard_sizes[s]} kb  Avg chunk size {data_size / num_chunks_per_shard} kb")
+    
+    avg_chunk_size_phase_2 /= len(chunks_id_index)
+    print(f'Average chunk size Phase I {avg_chunk_size_phase_1} kb  average chunk size Phase II {avg_chunk_size_phase_2} kb')
+
+    print(f"Total moved data: {total_moved_data_kb} kb i.e. {round(100 * total_moved_data_kb / coll_size_kb, 2)} %")
 
 if __name__ == "__main__":
     argsParser = argparse.ArgumentParser(
@@ -707,6 +761,10 @@ if __name__ == "__main__":
         type=lambda x: int(x) * 1024, required=False)
     argsParser.add_argument('--ns', help="""The namespace on which to perform defragmentation""",
                             metavar='ns', type=str, required=True)
+    argsParser.add_argument('--small-chunk-threshold', help="""Fractional value between 0 and 0.5""",
+                            metavar='fraction', dest='small_chunk_frac', type=float, default=0.25)
+    argsParser.add_argument('--shard-imbalance-threshold', help="""Fractional value between 1.0 and 1.3""",
+                            metavar='fraction', dest="shard_imbalance_frac", type=float, default=1.2)
     argsParser.add_argument(
         '--phase_1_reset_progress',
         help="""Applies only to Phase 1 and instructs the script to clear the chunk size estimation
