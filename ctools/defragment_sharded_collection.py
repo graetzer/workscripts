@@ -763,10 +763,12 @@ if __name__ == "__main__":
         type=lambda x: int(x) * 1024, required=False)
     argsParser.add_argument('--ns', help="""The namespace on which to perform defragmentation""",
                             metavar='ns', type=str, required=True)
-    argsParser.add_argument('--small-chunk-threshold', help="""Fractional value between 0 and 0.5""",
-                            metavar='fraction', dest='small_chunk_frac', type=float, default=0.25)
-    argsParser.add_argument('--shard-imbalance-threshold', help="""Fractional value between 1.0 and 1.5""",
-                            metavar='fraction', dest="shard_imbalance_frac", type=float, default=1.2)
+    argsParser.add_argument('--small-chunk-threshold', help="""Threshold for the size of chunks 
+        eligable to be moved in Phase II. Fractional value between 0 and 0.5""",
+        metavar='fraction', dest='small_chunk_frac', type=float, default=0.25)
+    argsParser.add_argument('--shard-imbalance-threshold', help="""Threshold for the size difference 
+        between two shards where chunks can be moved to. Fractional value between 1.0 and 1.5""",
+        metavar='fraction', dest="shard_imbalance_frac", type=float, default=1.2)
     argsParser.add_argument(
         '--phase_1_reset_progress',
         help="""Applies only to Phase 1 and instructs the script to clear the chunk size estimation
