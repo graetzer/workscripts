@@ -727,8 +727,8 @@ async def main(args):
             await asyncio.gather(*tasks)
 
     num_chunks = len(chunks_id_index)
-    print(f"""Number of chunks is {num_chunks} the ideal number of chunks would be {ideal_num_chunks} for a collection size of {coll_size_kb}""")
 
+    print("\nReached convergence: \n")
     avg_chunk_size_phase_2 = 0
     for s in shard_to_chunks:
         num_chunks_per_shard = len(shard_to_chunks[s]['chunks'])
@@ -738,8 +738,10 @@ async def main(args):
               f"Change vs phase I: {data_size - orig_shard_sizes[s]} kb  Avg chunk size {data_size / num_chunks_per_shard} kb")
     
     avg_chunk_size_phase_2 /= len(chunks_id_index)
-    print(f'Average chunk size Phase I {avg_chunk_size_phase_1} kb  average chunk size Phase II {avg_chunk_size_phase_2} kb')
 
+    print("\n")
+    print(f"""Number of chunks is {num_chunks} the ideal number of chunks would be {ideal_num_chunks} for a collection size of {coll_size_kb}""")
+    print(f'Average chunk size Phase I {avg_chunk_size_phase_1} kb  average chunk size Phase II {avg_chunk_size_phase_2} kb')
     print(f"Total moved data: {total_moved_data_kb} kb i.e. {round(100 * total_moved_data_kb / coll_size_kb, 2)} %")
 
 if __name__ == "__main__":
