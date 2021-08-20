@@ -735,7 +735,7 @@ async def main(args):
         data_size = total_shard_size[s]
         avg_chunk_size_phase_2 += data_size
         print(f"Number chunks on {s}: {num_chunks_per_shard}  Data-Size: {data_size} kb "
-              f"Change vs phase I: {data_size - orig_shard_sizes[s]} kb  Avg chunk size {data_size / num_chunks_per_shard} kb")
+              f" ({data_size - orig_shard_sizes[s]} kb)  Avg chunk size {round(data_size / num_chunks_per_shard, 2)} kb")
     
     avg_chunk_size_phase_2 /= len(chunks_id_index)
 
@@ -765,7 +765,7 @@ if __name__ == "__main__":
                             metavar='ns', type=str, required=True)
     argsParser.add_argument('--small-chunk-threshold', help="""Fractional value between 0 and 0.5""",
                             metavar='fraction', dest='small_chunk_frac', type=float, default=0.25)
-    argsParser.add_argument('--shard-imbalance-threshold', help="""Fractional value between 1.0 and 1.3""",
+    argsParser.add_argument('--shard-imbalance-threshold', help="""Fractional value between 1.0 and 1.5""",
                             metavar='fraction', dest="shard_imbalance_frac", type=float, default=1.2)
     argsParser.add_argument(
         '--phase_1_reset_progress',
