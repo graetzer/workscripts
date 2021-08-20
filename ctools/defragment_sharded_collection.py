@@ -740,8 +740,8 @@ async def main(args):
     avg_chunk_size_phase_2 /= len(chunks_id_index)
 
     print("\n")
-    print(f"""Number of chunks is {num_chunks} the ideal number of chunks would be {ideal_num_chunks} for a collection size of {coll_size_kb}""")
-    print(f'Average chunk size Phase I {avg_chunk_size_phase_1} kb  average chunk size Phase II {avg_chunk_size_phase_2} kb')
+    print(f"""Number of chunks is {num_chunks} the ideal number of chunks would be {ideal_num_chunks} for a collection size of {coll_size_kb} kb""")
+    print(f'Average chunk size Phase I {round(avg_chunk_size_phase_1, 2)} kb  average chunk size Phase II {round(avg_chunk_size_phase_2, 2)} kb')
     print(f"Total moved data: {total_moved_data_kb} kb i.e. {round(100 * total_moved_data_kb / coll_size_kb, 2)} %")
 
 if __name__ == "__main__":
