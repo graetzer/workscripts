@@ -34,7 +34,7 @@ class ShardedCollection:
 
     async def data_size_kb(self):
         data_size_response = await self.cluster.client[self.ns['db']].command({
-            'collStats': self.name,
+            'collStats': self.ns['coll'],
         }, codec_options=self.cluster.client.codec_options)
         return math.ceil(max(float(data_size_response['size']), 1024.0) / 1024.0)
 
